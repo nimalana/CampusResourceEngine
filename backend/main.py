@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -9,10 +11,19 @@ from routes.dining import router as dining_router
 from routes.search import router as search_router
 from routes.stats import router as stats_router
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from db_init import init_db
+    init_db()
+    yield
+
+
 app = FastAPI(
     title="UNC Resource Engine",
     description="Distributed campus resource API with consistent hashing, Redis cache-aside, and 2-replica writes.",
     version="1.0.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

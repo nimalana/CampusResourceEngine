@@ -1,95 +1,165 @@
 """
-In-memory sharded database using consistent hashing.
+PostgreSQL-backed sharded database using consistent hashing.
 
-Each resource is assigned to a shard via the hash ring.
-Write operations use 2-replica writes; reads include read-repair.
+Each shard maps to a dedicated PostgreSQL schema (shard_1 … shard_4).
+Write operations use 2-replica writes; reads include read-repair via updated_at.
 """
 
+import json
+import os
+from contextlib import contextmanager
 from typing import Any, Dict, List, Optional, Tuple
+
+import psycopg2
+import psycopg2.extras
+
 from consistent_hash import ring, SHARD_NAMES
-from seed_data import COURSES, CLUBS, RESEARCH, EVENTS, DINING
 
-# Each shard holds a dict keyed by resource_id
-_shards: Dict[str, Dict[str, Any]] = {name: {} for name in SHARD_NAMES}
-# Shard write timestamps for read-repair
-_shard_timestamps: Dict[str, Dict[str, float]] = {name: {} for name in SHARD_NAMES}
+# ── Connection config ─────────────────────────────────────────────────────────
+DB_HOST     = os.getenv("DB_HOST",     "localhost")
+DB_PORT     = int(os.getenv("DB_PORT", "5432"))
+DB_NAME     = os.getenv("DB_NAME",     "unc_resource_engine")
+DB_USER     = os.getenv("DB_USER",     "postgres")
+DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 
-import time as _time
 
+def _schema(shard: str) -> str:
+    """'shard-1' → 'shard_1'  (hyphens are not valid in PG schema names)."""
+    return shard.replace("-", "_")
+
+
+@contextmanager
+def _conn(shard: str):
+    """Context manager: open a connection scoped to the shard's schema."""
+    conn = psycopg2.connect(
+        host=DB_HOST,
+        port=DB_PORT,
+        dbname=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        options=f"-c search_path={_schema(shard)},public",
+    )
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
+# ── Internal write / read ─────────────────────────────────────────────────────
 
 def _put(resource_id: str, value: Any) -> List[str]:
-    """Write to primary + one replica (2-replica write). Returns list of written shards."""
+    """Write to primary + one replica (2-replica write). Returns written shards."""
     replicas = ring.get_replicas(resource_id, n=2)
-    ts = _time.time()
+    res_type = resource_id.split(":")[0]
+    data_json = json.dumps(value)
+
     for shard in replicas:
-        _shards[shard][resource_id] = value
-        _shard_timestamps[shard][resource_id] = ts
+        with _conn(shard) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO resources (id, type, data, updated_at)
+                    VALUES (%s, %s, %s::jsonb, NOW())
+                    ON CONFLICT (id) DO UPDATE
+                        SET data       = EXCLUDED.data,
+                            updated_at = NOW()
+                    """,
+                    (resource_id, res_type, data_json),
+                )
     return replicas
+
+
+def _fetch_row(shard: str, resource_id: str) -> Optional[dict]:
+    """Return the raw DB row {data, updated_at} or None."""
+    with _conn(shard) as conn:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                "SELECT data, updated_at FROM resources WHERE id = %s",
+                (resource_id,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
 
 
 def _get(resource_id: str) -> Tuple[Optional[Any], str]:
     """
-    Read from primary shard.
-    Performs read-repair if a replica has a newer timestamp.
-    Returns (value, shard_name).
+    Read from primary shard with read-repair.
+    If a replica has a fresher updated_at, it heals the primary.
+    Returns (value_dict, primary_shard_name).
     """
-    primary = ring.get_node(resource_id)
+    primary  = ring.get_node(resource_id)
     replicas = ring.get_replicas(resource_id, n=2)
 
-    value = _shards[primary].get(resource_id)
-    primary_ts = _shard_timestamps[primary].get(resource_id, 0)
+    primary_row = _fetch_row(primary, resource_id)
+    best_row    = primary_row
+    best_ts     = primary_row["updated_at"] if primary_row else None
 
-    # Read-repair: scan replicas for fresher data
     for shard in replicas:
-        shard_ts = _shard_timestamps[shard].get(resource_id, 0)
-        if shard_ts > primary_ts and resource_id in _shards[shard]:
-            # Repair primary with fresher replica data
-            _shards[primary][resource_id] = _shards[shard][resource_id]
-            _shard_timestamps[primary][resource_id] = shard_ts
-            value = _shards[primary][resource_id]
-            primary_ts = shard_ts
+        if shard == primary:
+            continue
+        row = _fetch_row(shard, resource_id)
+        if row and (best_ts is None or row["updated_at"] > best_ts):
+            best_row = row
+            best_ts  = row["updated_at"]
 
+    # Repair primary if we found fresher data elsewhere
+    if best_row and best_row is not primary_row:
+        with _conn(primary) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO resources (id, type, data, updated_at)
+                    VALUES (%s, %s, %s::jsonb, %s)
+                    ON CONFLICT (id) DO UPDATE
+                        SET data       = EXCLUDED.data,
+                            updated_at = EXCLUDED.updated_at
+                    """,
+                    (
+                        resource_id,
+                        resource_id.split(":")[0],
+                        json.dumps(dict(best_row["data"])),
+                        best_ts,
+                    ),
+                )
+
+    value = dict(best_row["data"]) if best_row else None
     return value, primary
 
 
 def _list_by_type(resource_type: str) -> Tuple[List[Any], Dict[str, int]]:
-    """List all resources of a given type. Returns (items, shard_counts)."""
-    items = []
+    """Return all unique records of a given type plus per-shard counts."""
+    seen_ids:    set            = set()
+    unique:      List[Any]      = []
     shard_counts: Dict[str, int] = {s: 0 for s in SHARD_NAMES}
-    for shard, store in _shards.items():
-        for key, val in store.items():
-            if key.startswith(f"{resource_type}:"):
-                items.append(val)
-                shard_counts[shard] += 1
-    # De-duplicate (a key may live in 2 shards via replication)
-    seen_ids = set()
-    unique = []
-    for item in items:
-        item_id = item.get("id", "")
-        if item_id not in seen_ids:
-            seen_ids.add(item_id)
-            unique.append(item)
+
+    for shard in SHARD_NAMES:
+        with _conn(shard) as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT id, data FROM resources WHERE type = %s",
+                    (resource_type,),
+                )
+                rows = cur.fetchall()
+                shard_counts[shard] = len(rows)
+                for row in rows:
+                    if row["id"] not in seen_ids:
+                        seen_ids.add(row["id"])
+                        unique.append(dict(row["data"]))
+
     return unique, shard_counts
 
 
-def _seed(resource_type: str, items: List[dict]):
-    for item in items:
-        _put(f"{resource_type}:{item['id']}", item)
+# ── Public API ────────────────────────────────────────────────────────────────
 
-
-# Seed on import
-_seed("course", COURSES)
-_seed("club", CLUBS)
-_seed("research", RESEARCH)
-_seed("event", EVENTS)
-_seed("dining", DINING)
-
-
-# ── Public API ──────────────────────────────────────────────────────────────
-
-def get_resource(resource_type: str, resource_id: str) -> Tuple[Optional[dict], str, List[str]]:
+def get_resource(
+    resource_type: str, resource_id: str
+) -> Tuple[Optional[dict], str, List[str]]:
     """Returns (item, primary_shard, replica_shards)."""
-    key = f"{resource_type}:{resource_id}"
+    key      = f"{resource_type}:{resource_id}"
     value, primary = _get(key)
     replicas = ring.get_replicas(key, n=2)
     return value, primary, replicas
@@ -101,20 +171,27 @@ def list_resources(resource_type: str) -> Tuple[List[dict], Dict[str, int]]:
 
 def search_all(query: str) -> List[dict]:
     query_lower = query.lower()
-    results = []
-    seen_ids = set()
+    results: List[dict] = []
+    seen_ids: set = set()
+
     for resource_type in ["course", "club", "research", "event", "dining"]:
         items, _ = _list_by_type(resource_type)
         for item in items:
             item_id = item.get("id", "")
             if item_id in seen_ids:
                 continue
-            text = " ".join(str(v) for v in item.values()).lower()
-            if query_lower in text:
+            if query_lower in " ".join(str(v) for v in item.values()).lower():
                 seen_ids.add(item_id)
                 results.append({"type": resource_type, **item})
+
     return results
 
 
 def get_shard_distribution() -> Dict[str, int]:
-    return {shard: len(store) for shard, store in _shards.items()}
+    counts: Dict[str, int] = {}
+    for shard in SHARD_NAMES:
+        with _conn(shard) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM resources")
+                counts[shard] = cur.fetchone()[0]
+    return counts
